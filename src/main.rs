@@ -16,11 +16,9 @@ use crate::master::{
 
 /// JSONL log file, relative to the working directory.
 const CRD_LOG_FILE: &str = "logs/crd_master.jsonl";
-
 /// Rotate the log file at this size, keeping `CRD_LOG_FILE_KEEP` old files.
 const CRD_LOG_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const CRD_LOG_FILE_KEEP: u32 = 5;
-
 /// How long the CLI waits for a command to finish before giving up.
 const CRD_REPORT_WAIT: Duration = Duration::from_secs(2);
 
