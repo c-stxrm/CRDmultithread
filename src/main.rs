@@ -17,6 +17,10 @@ use crate::master::{
 /// JSONL log file, relative to the working directory.
 const CRD_LOG_FILE: &str = "logs/crd_master.jsonl";
 
+/// Rotate the log file at this size, keeping `CRD_LOG_FILE_KEEP` old files.
+const CRD_LOG_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const CRD_LOG_FILE_KEEP: u32 = 5;
+
 /// How long the CLI waits for a command to finish before giving up.
 const CRD_REPORT_WAIT: Duration = Duration::from_secs(2);
 
@@ -24,11 +28,11 @@ const CRD_REPORT_WAIT: Duration = Duration::from_secs(2);
 // LOGGING SETUP
 // ============================================================================
 
-/// Builds the logger: colored stdout plus a JSONL file.
+/// Builds the logger: colored stdout plus a rotating JSONL file.
 ///
-/// Stdout level comes from the `CRD_LOG` environment variable
-/// (trace|debug|info|warn|error), default `warn`. The file always gets
-/// everything (`trace`).
+/// - Stdout level: `CRD_LOG` (trace|debug|info|warn|error), default `warn`.
+/// - File level: `CRD_LOG_FILE_LEVEL`, default `info`. Set it to `trace` to
+///   get payload dumps and per-progress records; that is much more volume.
 fn crd_build_logs() -> CRDMasterLogs {
     let logs = CRDMasterLogs::new();
 
@@ -37,15 +41,38 @@ fn crd_build_logs() -> CRDMasterLogs {
         .and_then(|value| CRDLogLevel::parse(&value))
         .unwrap_or(CRDLogLevel::Warn);
 
+    let file_level_text = std::env::var("CRD_LOG_FILE_LEVEL").ok();
+    let file_level = file_level_text
+        .as_deref()
+        .and_then(CRDLogLevel::parse)
+        .unwrap_or(CRDLogLevel::Info);
+
     logs.add_sink(CRDStdoutSink::new(stdout_level));
 
-    match CRDJsonlSink::open(CRD_LOG_FILE, CRDLogLevel::Trace) {
+    if let Some(text) = &file_level_text {
+        if CRDLogLevel::parse(text).is_none() {
+            logs.warn(
+                "crd.main",
+                &format!("unknown CRD_LOG_FILE_LEVEL {:?}, using info", text),
+            );
+        }
+    }
+
+    match CRDJsonlSink::open_with_rotation(
+        CRD_LOG_FILE,
+        file_level,
+        CRD_LOG_FILE_MAX_BYTES,
+        CRD_LOG_FILE_KEEP,
+    ) {
         Ok(sink) => logs.add_sink(sink),
         Err(error) => logs.warn(
             "crd.main",
             &format!("cannot open log file {}: {}", CRD_LOG_FILE, error),
         ),
     }
+
+    // Log panics and drain the queue before the process goes down.
+    logs.install_panic_hook();
 
     logs
 }
@@ -122,7 +149,7 @@ fn main() {
         Err(error) => {
             println!("Cannot start the job: {}", error);
             logs.error("crd.main", &format!("cannot start the job: {}", error));
-            logs.flush();
+            logs.shutdown();
             return;
         }
     };
@@ -132,7 +159,7 @@ fn main() {
     println!("==================================");
     crd_print_help();
     println!("==================================");
-    println!("log file: {}  (set CRD_LOG=debug for live detail)", CRD_LOG_FILE);
+    println!("log file: {}  (CRD_LOG=info for live detail, CRD_LOG_FILE_LEVEL=trace for payloads)", CRD_LOG_FILE);
 
     loop {
         crd_print_displays(&hello);
@@ -243,5 +270,6 @@ fn main() {
             crd_field("live_threads", master.threads().len()),
         ],
     );
-    logs.flush();
+    // Drains the queue, flushes the sinks and joins the logger thread.
+    logs.shutdown();
 }

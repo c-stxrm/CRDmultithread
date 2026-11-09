@@ -43,7 +43,7 @@ use crate::interfaces::crd_job::{
 
 use super::command_table::{CRDMasterCommandTable, CRDReportOutcome};
 use super::ids::{crd_current_thread_id, CRDJobId, CRDJobKey, CRDThreadId};
-use super::logs::{crd_field, CRDLogLevel, CRDMasterLogs};
+use super::logs::{crd_field, crd_static, CRDFields, CRDLogLevel, CRDMasterLogs};
 use super::queues::{
     CRDMasterCommandReportQueue, CRDMasterDisplay, CRDMasterDisplayQueue, CRDMasterReport,
 };
@@ -177,7 +177,7 @@ impl CRDMaster {
                         "crd.master",
                         "cannot create job thread",
                         &[
-                            crd_field("job", name),
+                            crd_static("job", name),
                             crd_field("instance", index as u64),
                             crd_field("error", error.to_string()),
                         ],
@@ -195,7 +195,7 @@ impl CRDMaster {
             "crd.master",
             "job group spawned",
             &[
-                crd_field("job", name),
+                crd_static("job", name),
                 crd_field("job_id", u64::from(job_id.0)),
                 crd_field("instances", instance_count),
             ],
@@ -257,7 +257,7 @@ impl<J: CRDJob> CRDJobGroup<J> {
             "crd.master",
             "job group shutting down",
             &[
-                crd_field("job", self.name),
+                crd_static("job", self.name),
                 crd_field("instances", self.threads.len()),
             ],
         );
@@ -269,7 +269,7 @@ impl<J: CRDJob> CRDJobGroup<J> {
                 self.logs.error_with(
                     "crd.master",
                     "job thread panicked",
-                    &[crd_field("job", self.name)],
+                    &[crd_static("job", self.name)],
                 );
             }
         }
@@ -324,7 +324,7 @@ impl CRDThreadGuard {
             "crd.thread",
             "job thread started",
             &[
-                crd_field("job", name),
+                crd_static("job", name),
                 crd_field("instance", key.instance),
                 crd_field("thread", thread_name),
             ],
@@ -346,7 +346,7 @@ impl Drop for CRDThreadGuard {
         self.threads.unregister_thread(self.thread_id);
 
         let fields = [
-            crd_field("job", self.name),
+            crd_static("job", self.name),
             crd_field("instance", self.key.instance),
         ];
 
@@ -422,26 +422,30 @@ impl<R: Debug, D: Debug> CRDJobOutput<u64, R, D> for CRDMasterJobOutput<R, D> {
             report.message.as_deref(),
         );
 
+        // Per-`Working` progress is the chattiest record there is, so it sits
+        // at Trace. Info is for terminal reports; protocol problems and
+        // failures are Warn.
         let level = match (&outcome, report.status) {
             (CRDReportOutcome::Unknown, _) => CRDLogLevel::Warn,
-            (_, CRDReportStatus::Working) => CRDLogLevel::Debug,
+            (_, CRDReportStatus::Working) => CRDLogLevel::Trace,
             (_, CRDReportStatus::Success) => CRDLogLevel::Info,
             (_, CRDReportStatus::Error) => CRDLogLevel::Warn,
         };
 
         if self.logs.enabled(level) {
-            let mut fields = vec![
-                crd_field("command", report.command_id),
-                crd_field("status", crd_status_str(report.status)),
-                crd_field("job", self.name),
-                crd_field("instance", self.key.instance),
-            ];
+            // At most 8 fields, kept on the stack.
+            let mut fields = CRDFields::<8>::new();
+            fields.push(crd_field("command", report.command_id));
+            fields.push(crd_static("status", crd_status_str(report.status)));
+            fields.push(crd_static("job", self.name));
+            fields.push(crd_field("instance", self.key.instance));
 
             if let Some(message) = &report.message {
                 fields.push(crd_field("message", message.as_str()));
             }
 
-            if self.logs.enabled(CRDLogLevel::Debug) {
+            // Payload dump: allocation plus formatting, so Trace only.
+            if self.logs.enabled(CRDLogLevel::Trace) {
                 if let Some(data) = &report.data {
                     fields.push(crd_field("data", format!("{:?}", data)));
                 }
@@ -463,7 +467,7 @@ impl<R: Debug, D: Debug> CRDJobOutput<u64, R, D> for CRDMasterJobOutput<R, D> {
                 CRDReportOutcome::Updated => "command progress",
             };
 
-            self.logs.log(level, "crd.report", text, &fields);
+            self.logs.log(level, "crd.report", text, fields.as_slice());
         }
 
         // The owner may have dropped its queue; reports are then discarded.
@@ -474,12 +478,13 @@ impl<R: Debug, D: Debug> CRDJobOutput<u64, R, D> for CRDMasterJobOutput<R, D> {
     }
 
     fn display(&mut self, display: CRDJobDisplay<D>) {
-        if self.logs.enabled(CRDLogLevel::Debug) {
-            self.logs.debug_with(
+        // Display payloads are dumped with `{:?}`, so Trace only.
+        if self.logs.enabled(CRDLogLevel::Trace) {
+            self.logs.trace_with(
                 "crd.display",
                 "display published",
                 &[
-                    crd_field("job", self.name),
+                    crd_static("job", self.name),
                     crd_field("instance", self.key.instance),
                     crd_field("data", format!("{:?}", display.data)),
                 ],
@@ -503,7 +508,7 @@ impl<R, D> Drop for CRDMasterJobOutput<R, D> {
                 "command abandoned: the job ended without a terminal report",
                 &[
                     crd_field("command", record.id),
-                    crd_field("job", self.name),
+                    crd_static("job", self.name),
                     crd_field("instance", self.key.instance),
                     crd_field("reports", record.report_count),
                 ],

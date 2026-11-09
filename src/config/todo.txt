@@ -1,0 +1,2 @@
+make choosables and configurables handled here
+- Not yet built: JSON configuration, graceful per-command cancellation.

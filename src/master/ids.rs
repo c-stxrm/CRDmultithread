@@ -41,13 +41,24 @@ pub fn crd_current_thread_id() -> CRDThreadId {
     unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() as CRDThreadId }
 }
 
-/// Returns a stable per-thread id (non-Windows fallback).
+/// Returns a stable per-thread id (non-Windows fallback). Hashed once per
+/// thread and cached in a thread-local.
 #[cfg(not(windows))]
 pub fn crd_current_thread_id() -> CRDThreadId {
     use std::hash::Hash;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::thread::current().id().hash(&mut hasher);
-    hasher.finish()
+
+    fn compute() -> CRDThreadId {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    thread_local! {
+        static CACHED: CRDThreadId = compute();
+    }
+
+    // `try_with` fails only while the thread-local is being destroyed.
+    CACHED.try_with(|id| *id).unwrap_or_else(|_| compute())
 }
 
 // ============================================================================

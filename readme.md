@@ -51,7 +51,7 @@ src/
 └── master/
     ├── mod.rs                   module map + re-exports
     ├── ids.rs                   ids, fast integer hasher, thread id
-    ├── logs.rs                  CRDMasterLogs + sinks
+    ├── logs.rs                  CRDMasterLogs (logger thread) + sinks
     ├── command_table.rs         CRDMasterCommandTable
     ├── thread_table.rs          CRDMasterThreadTable
     ├── queues.rs                command/report queue, display queue
@@ -73,7 +73,7 @@ flowchart LR
         DQ["CRDMasterDisplayQueue"]
         CT[("CRDMasterCommandTable<br/>in-flight commands")]
         TT[("CRDMasterThreadTable<br/>live threads + jobs")]
-        LG["CRDMasterLogs<br/>stdout + JSONL"]
+        LG["CRDMasterLogs<br/>logger thread: stdout + JSONL"]
     end
 
     subgraph GROUP["Job group: hello_world"]
@@ -237,6 +237,7 @@ while let Ok(envelope) = group.queue().recv_report_timeout(Duration::from_secs(1
 let displays = group.take_display_queue();
 
 group.shutdown(); // also runs on drop
+logs.shutdown();  // drain the log queue and join the logger thread
 ```
 
 Requirements on a hosted job: `CommandId = u64`, and `Command`, `ReportData`
@@ -250,7 +251,7 @@ and `DisplayData` implement `Debug`.
 | Thread table  | `CRDMasterThreadTable`  | live threads and the jobs pinned to them |
 | Command/report queue | `CRDMasterCommandReportQueue<C, R>` | per job group: round-robin dispatch out, merged reports in |
 | Display queue | `CRDMasterDisplayQueue<D>` | per job group: merged unsolicited displays |
-| Logs | `CRDMasterLogs` | colored multi-sink logging |
+| Logs | `CRDMasterLogs` | async multi-sink logging on its own thread |
 
 ### Command table: built for speed
 
@@ -296,18 +297,38 @@ violation.
 
 ## Logging
 
+Logging never does formatting or I/O on the calling thread. A call site copies
+the record into a bounded queue and returns. One `crd-logger` thread owns the
+sinks, formats, writes and flushes.
+
 ```mermaid
 flowchart LR
     C["CRDMasterLogs<br/>(clone anywhere)"] --> F{"enabled?<br/>lock-free level check"}
-    F -- no --> X["dropped, nothing built"]
-    F -- yes --> S["sinks, serialised"]
-    S --> O["CRDStdoutSink<br/>colored, own min level"]
-    S --> J["CRDJsonlSink<br/>logs/crd_master.jsonl"]
-    S --> N["your CRDLogSink<br/>add_sink(...)"]
+    F -- no --> X["rejected, nothing built"]
+    F -- yes --> Q["bounded queue<br/>(8192 records)"]
+    Q --> L["crd-logger thread<br/>owns the sinks"]
+    L --> O["CRDStdoutSink<br/>colored, own min level"]
+    L --> J["CRDJsonlSink<br/>logs/crd_master.jsonl<br/>size-based rotation"]
+    L --> N["your CRDLogSink<br/>add_sink(...)"]
 ```
 
 A new destination is a type that implements `CRDLogSink` (`min_level`,
-`write`, optional `flush`). The logger never changes.
+`write`, optional `flush`). The logger never changes. A sink is only ever
+called from the logger thread, one record at a time, so it needs no locking.
+Buffer in `write`, push data out in `flush`.
+
+**Behaviour**
+
+| Situation | What happens |
+|-----------|--------------|
+| Queue full, record is `Trace` or `Debug` | dropped and counted. When the backlog clears, one `N log records dropped (queue full)` warning is written |
+| Queue full, record is `Info` or above | the caller waits for room, so lifecycle lines are never lost |
+| `Warn` or `Error` record | flushed to the sinks immediately |
+| `Error` record | the caller also waits (2 s at most) until it is flushed, so a crash cannot lose the line that explains it |
+| Normal flow | sinks are flushed when the queue runs empty, and at least every 200 ms under continuous load |
+| `logs.flush()` | writes everything queued so far and flushes the sinks |
+| `logs.shutdown()` | drains the queue, flushes, joins the thread. Also happens when the last handle is dropped. Records logged afterwards are discarded |
+| `logs.install_panic_hook()` | logs panics at `ERROR` and drains the queue before the previous hook runs |
 
 Stdout line:
 
@@ -315,7 +336,7 @@ Stdout line:
 12:00:00.123 INFO  tid=4242   crd.report command finished command=1 status=success job=hello_world instance=0 reports=2 elapsed_us=412
 ```
 
-JSONL line (one object per line, flushed per record):
+JSONL line (one object per line, flushed in batches):
 
 ```json
 {"ts":"2026-11-09T12:00:00.123Z","ts_ms":1794225600123,"level":"INFO","source":"crd.report","tid":4242,"msg":"command finished","fields":{"command":1,"status":"success","job":"hello_world","instance":0,"reports":2,"elapsed_us":412}}
@@ -323,21 +344,45 @@ JSONL line (one object per line, flushed per record):
 
 | Level | Used for |
 |-------|----------|
-| `TRACE` / `DEBUG` | command dispatch, `Working` reports, displays, payload dumps |
+| `TRACE` | command dispatch, `Working` reports, displays, payload dumps (`data=`, `command=`) |
+| `DEBUG` | metadata only (nothing in the master uses it by default) |
 | `INFO`  | job group and thread lifecycle, terminal `Success` reports |
-| `WARN`  | `Error` reports, unreachable instances, protocol violations |
+| `WARN`  | `Error` reports, unreachable instances, protocol violations, dropped-record notice |
 | `ERROR` | thread creation failure, panics, abandoned commands |
 
-Guard expensive messages with `logs.enabled(level)`. Color turns on only
-when stdout is a terminal and `NO_COLOR` is unset.
+**Keeping logging cheap**
+
+- Payload dumps (`format!("{:?}", ...)`) belong at `Trace`, behind
+  `logs.enabled(CRDLogLevel::Trace)`. A disabled level costs one atomic load.
+- Use `crd_static("job", name)` for `&'static str` values. It carries the
+  string without allocating. `crd_field` copies a `&str`.
+- Use `CRDFields::<N>` for a field list whose length varies, instead of a
+  `Vec`.
+- A record still costs one allocation for the message and one for the fields.
+
+**JSONL rotation**
+
+```rust
+// start a new file at 10 MiB, keep app.jsonl.1 .. app.jsonl.5
+CRDJsonlSink::open_with_rotation("logs/app.jsonl", CRDLogLevel::Info, 10 * 1024 * 1024, 5)?
+```
+
+`app.jsonl` becomes `app.jsonl.1`, `.1` becomes `.2`, and so on. The file past
+the limit is deleted. Rotation runs on the logger thread. `CRDJsonlSink::open`
+still gives an unbounded file.
+
+Color turns on only when stdout is a terminal and `NO_COLOR` is unset.
 
 ## Running
 
 ```powershell
 cargo run
 
-# live detail on stdout (the file always records everything)
-$env:CRD_LOG = "debug"; cargo run
+# live detail on stdout
+$env:CRD_LOG = "info"; cargo run
+
+# payload dumps and per-progress records in the file (much more volume)
+$env:CRD_LOG_FILE_LEVEL = "trace"; cargo run
 
 # read the JSONL log
 Get-Content logs\crd_master.jsonl -Tail 20
@@ -355,8 +400,9 @@ Get-Content logs\crd_master.jsonl -Tail 20
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `CRD_LOG` | `warn` | stdout level: trace, debug, info, warn, error |
+| `CRD_LOG_FILE_LEVEL` | `info` | file level, same values. `trace` adds payload dumps and `Working` progress |
 | `NO_COLOR` | unset | any value disables colors |
-| `logs/crd_master.jsonl` | | JSONL file, appended to, always `trace` |
+| `logs/crd_master.jsonl` | | JSONL file, appended to, rotated at 10 MiB, 5 old files kept (`.1` to `.5`) |
 
 Windows colors need the `Win32_System_Console` feature of `windows-sys`:
 
@@ -373,6 +419,7 @@ cargo add windows-sys --features Win32_System_Console
 | **Liskov** | every `CRDJobHandler` is a `CRDJob` through one blanket impl, and the master hosts any `CRDJob` |
 | **Interface segregation** | jobs see only `CRDJobOutput`. Tables, queues and logs are invisible to them |
 | **Dependency inversion** | jobs depend on the `CRDJobOutput` abstraction. The master supplies the implementation. The logger depends on the `CRDLogSink` trait |
+| **Never block the hot path** | call sites only enqueue. All formatting and I/O happens on the logger thread |
 
 ## Limits and roadmap
 
@@ -381,5 +428,9 @@ cargo add windows-sys --features Win32_System_Console
 - Each report and display queue has one consumer (`mpsc`).
 - `Debug` is required on job payloads for logging.
 - Command ids are master-assigned `u64` counters.
-- Not yet built: JSON configuration, log rotation, graceful per-command
-  cancellation.
+- The log queue is bounded. `Info` and above wait when it is full, so a
+  stuck sink can stall callers. `Trace` and `Debug` are dropped and counted.
+- A hard crash (abort, power loss) can lose records still in the queue.
+  `Error` records and panics are flushed first.
+- Per-`Working` progress streams are not sampled, only moved to `Trace`.
+- Not yet built: JSON configuration, graceful per-command cancellation.

@@ -18,7 +18,7 @@
 //! Responsibilities (one reason to change each):
 //!
 //! - `ids`           : identifiers and the fast integer hasher.
-//! - `logs`          : logging core and sinks. Knows nothing about jobs.
+//! - `logs`          : async logging core (logger thread) and sinks. Knows nothing about jobs.
 //! - `command_table` : in-flight command bookkeeping.
 //! - `thread_table`  : live thread / pinned job bookkeeping.
 //! - `queues`        : typed per-job queues (commands, reports, displays).
@@ -42,8 +42,8 @@ pub use command_table::{
 };
 pub use ids::{CRDCommandKey, CRDJobId, CRDJobKey, CRDThreadId};
 pub use logs::{
-    crd_field, CRDJsonlSink, CRDLogLevel, CRDLogRecord, CRDLogSink, CRDLogValue, CRDMasterLogs,
-    CRDStdoutSink,
+    crd_field, crd_static, CRDFields, CRDJsonlSink, CRDLogLevel, CRDLogRecord, CRDLogSink,
+    CRDLogValue, CRDMasterLogs, CRDStdoutSink, CRDUtcTime,
 };
 pub use queues::{
     CRDMasterCommandReportQueue, CRDMasterDisplay, CRDMasterDisplayQueue, CRDMasterReport,

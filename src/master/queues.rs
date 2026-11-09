@@ -21,7 +21,7 @@ use crate::interfaces::crd_job::{CRDJobCommand, CRDJobReport};
 
 use super::command_table::CRDMasterCommandTable;
 use super::ids::{CRDCommandKey, CRDJobId, CRDJobKey};
-use super::logs::{crd_field, CRDMasterLogs};
+use super::logs::{crd_field, crd_static, CRDLogLevel, CRDMasterLogs};
 
 // ============================================================================
 // 1. ENVELOPES
@@ -158,9 +158,11 @@ impl<C: Debug, R> CRDMasterCommandReportQueue<C, R> {
         }
 
         let id = self.table.next_id();
+        // The payload dump is a heap allocation plus a formatting pass, so it
+        // is built only when some sink wants Trace.
         let command_text = self
             .logs
-            .enabled(super::logs::CRDLogLevel::Debug)
+            .enabled(CRDLogLevel::Trace)
             .then(|| format!("{:?}", data));
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
 
@@ -176,12 +178,12 @@ impl<C: Debug, R> CRDMasterCommandReportQueue<C, R> {
             match self.senders[instance].send(CRDJobCommand { id, data }) {
                 Ok(()) => {
                     if let Some(text) = command_text {
-                        self.logs.debug_with(
+                        self.logs.trace_with(
                             "crd.queue",
                             "command dispatched",
                             &[
                                 crd_field("command", id),
-                                crd_field("job", self.name),
+                                crd_static("job", self.name),
                                 crd_field("instance", instance as u64),
                                 crd_field("data", text),
                             ],
@@ -197,7 +199,7 @@ impl<C: Debug, R> CRDMasterCommandReportQueue<C, R> {
                         "job instance unreachable, trying the next one",
                         &[
                             crd_field("command", id),
-                            crd_field("job", self.name),
+                            crd_static("job", self.name),
                             crd_field("instance", instance as u64),
                         ],
                     );
